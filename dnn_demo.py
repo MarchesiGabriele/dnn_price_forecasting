@@ -40,7 +40,7 @@ args = {
     'context_window_days': [-1,-2,-7], # days indexes before the forecast horizon
     'full_history_hours': 168, # total hours to use for RevIN stats
     'epochs': 800,
-    'patience': 100,
+    'patience': 10,
     'learning_rate': 5e-4,
     'batch_size': 128,
     'num_workers': 4,
@@ -312,14 +312,7 @@ def compute_crps_quantile(labels: np.ndarray, pred_quantiles: np.ndarray, quanti
     errors = labels_flat[:, None] - pred_flat
     quantiles_row = quantiles[None, :]
     loss = np.maximum(quantiles_row * errors, (quantiles_row - 1.0) * errors)
-
-    # Standard quantile-based CRPS approximation:
-    # CRPS = 2 * integral_0^1 pinball(q) dq
-    if quantiles.size == 1:
-        return float(2.0 * np.mean(loss))
-    integrate = np.trapezoid if hasattr(np, "trapezoid") else np.trapz
-    crps_per_observation = 2.0 * integrate(loss, quantiles, axis=1)
-    return float(np.mean(crps_per_observation))
+    return float(np.mean(loss))
 
 
 def _sample_normal_quantiles(

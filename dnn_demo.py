@@ -426,13 +426,20 @@ def compute_results_metrics(
     point_pred = pred_quantiles[:, 0, point_idx]
     y_true_flat = y_true[:, 0]
 
-    picp_label = f"PICP_{int(round(alpha * 100))}"
     metrics = {
         "MAE": MAE(point_pred, y_true_flat),
         "RMSE": RMSE(point_pred, y_true_flat),
-        picp_label: compute_picp(y_true, pred_quantiles, quantiles, alpha),
-        "CRPS": compute_crps_quantile(y_true, pred_quantiles, quantiles),
     }
+
+    for picp_alpha in sorted({0.50, 0.90, 0.98, float(alpha)}):
+        metrics[f"PICP_{int(round(picp_alpha * 100))}"] = compute_picp(
+            y_true,
+            pred_quantiles,
+            quantiles,
+            picp_alpha,
+        )
+
+    metrics["CRPS"] = compute_crps_quantile(y_true, pred_quantiles, quantiles)
 
     print(f"\nMetrics for {model_type} on {len(common_index)} timestamps:")
     for metric_name, metric_value in metrics.items():

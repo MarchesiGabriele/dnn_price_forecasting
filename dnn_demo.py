@@ -12,6 +12,8 @@ import torch
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from torch import nn
+import torch.nn.functional as F
+import torch.distributions as dist
 
 
 # In[ ]:
@@ -21,7 +23,7 @@ args = {
     'seed': 20,
     'region': "BE",
     'predict_horizon': 24,
-    'recalibration_shift_days': 180,
+    'recalibration_shift_days': 100,
     'val_ratio': 0.2, # % of the train data to use for validation
 
     # Data parameters
@@ -37,6 +39,7 @@ args = {
     'hidden_layers': 2,
     'activation_fn': 'ReLU', # currently only ReLU is allowed
     'dropout_rate': 0.1,
+    'mixture_components': 3,
     'context_window_days': [-1,-2,-7], # days indexes before the forecast horizon
     'full_history_hours': 168, # total hours to use for RevIN stats
     'epochs': 800,
@@ -168,7 +171,7 @@ class PinballLoss(torch.nn.Module):
         }
 
 
-class GaussianNLLLoss(torch.nn.Module):
+class DistributionNLLLoss(torch.nn.Module):
     def forward(self, y_true, pred_dist):
         # y_true: (batch, horizon)
         # pred_dist: torch.distributions.Distribution with batch_shape (batch, horizon)
@@ -346,6 +349,54 @@ def _sample_normal_quantiles(
     return sampled_quantiles
 
 
+def _sample_mixnormal_quantiles(
+    loc: np.ndarray,
+    scale: np.ndarray,
+    logits: np.ndarray,
+    quantiles: np.ndarray,
+    num_samples: int = 1000,
+    seed: int = 20,
+    chunk_size: int = 512,
+) -> np.ndarray:
+    loc = np.asarray(loc, dtype=np.float64)
+    scale = np.asarray(scale, dtype=np.float64)
+    logits = np.asarray(logits, dtype=np.float64)
+    quantiles = np.asarray(quantiles, dtype=np.float64)
+
+    if loc.ndim != 2 or scale.ndim != 2 or logits.ndim != 2:
+        raise ValueError("loc, scale and logits must have shape (N, K)")
+    if loc.shape != scale.shape or loc.shape != logits.shape:
+        raise ValueError("loc, scale and logits must share the same shape")
+
+    if np.any(scale <= 0):
+        scale = np.maximum(scale, 1e-6)
+
+    rng = np.random.default_rng(seed)
+    sampled_quantiles = np.empty((loc.shape[0], quantiles.shape[0]), dtype=np.float64)
+
+    for start in range(0, loc.shape[0], chunk_size):
+        end = min(start + chunk_size, loc.shape[0])
+        loc_chunk = loc[start:end]
+        scale_chunk = scale[start:end]
+        logits_chunk = logits[start:end]
+
+        shifted_logits = logits_chunk - logits_chunk.max(axis=1, keepdims=True)
+        probs = np.exp(shifted_logits)
+        probs /= probs.sum(axis=1, keepdims=True)
+
+        cdf = np.cumsum(probs, axis=1)
+        uniforms = rng.random((end - start, num_samples))
+        comp_idx = np.sum(uniforms[..., None] > cdf[:, None, :-1], axis=-1)
+
+        row_idx = np.arange(end - start)[:, None]
+        chosen_loc = loc_chunk[row_idx, comp_idx]
+        chosen_scale = scale_chunk[row_idx, comp_idx]
+        draws = rng.normal(loc=chosen_loc, scale=chosen_scale)
+        sampled_quantiles[start:end] = np.quantile(draws, quantiles, axis=1).T
+
+    return sampled_quantiles
+
+
 def load_results_quantiles(
     model_type: str,
     quantiles: np.ndarray | None = None,
@@ -394,6 +445,33 @@ def load_results_quantiles(
         pred_quantiles = _sample_normal_quantiles(
             loc=preds_df["loc"].to_numpy(dtype=np.float64),
             scale=preds_df["scale"].to_numpy(dtype=np.float64),
+            quantiles=quantiles,
+            num_samples=num_samples,
+            seed=args["seed"] if seed is None else seed,
+            chunk_size=chunk_size,
+        )
+    elif model_type == "DNN_MIXN":
+        num_components = int(args["mixture_components"])
+        loc_columns = [f"loc_{i+1}" for i in range(num_components)]
+        scale_columns = [f"scale_{i+1}" for i in range(num_components)]
+        logit_columns = [f"logit_{i+1}" for i in range(num_components)]
+
+        expected_columns = set(loc_columns + scale_columns + logit_columns)
+        if not expected_columns.issubset(preds_df.columns):
+            raise ValueError(
+                f"{pred_path} must contain mixture columns {sorted(expected_columns)}"
+            )
+
+        if quantiles is None:
+            quantiles = np.asarray(args["target_quantiles"], dtype=np.float64)
+        else:
+            quantiles = np.asarray(quantiles, dtype=np.float64)
+        quantiles = np.sort(quantiles)
+
+        pred_quantiles = _sample_mixnormal_quantiles(
+            loc=preds_df[loc_columns].to_numpy(dtype=np.float64),
+            scale=preds_df[scale_columns].to_numpy(dtype=np.float64),
+            logits=preds_df[logit_columns].to_numpy(dtype=np.float64),
             quantiles=quantiles,
             num_samples=num_samples,
             seed=args["seed"] if seed is None else seed,
@@ -459,8 +537,8 @@ def train_on_split(train_raw, suffix, feature_cols, model_class, model_type):
     model.to(device)
     if model_type == "DNN":
         loss_fn = PinballLoss(args['target_quantiles']).to(device)
-    elif model_type == "DNN_N":
-        loss_fn = GaussianNLLLoss().to(device)
+    elif model_type in {"DNN_N", "DNN_MIXN"}:
+        loss_fn = DistributionNLLLoss().to(device)
     else:
         raise ValueError(f"Model type {model_type} not supported")
     optimizer = torch.optim.Adam(model.parameters(), lr=args['learning_rate'])
@@ -639,14 +717,35 @@ def walk_forward_experiment(model_class, model_type):
             if model_type == "DNN":
                 output = model(past_target, future_features, target_mean, target_std).squeeze(0)
             elif model_type == "DNN_N":
-                pred_params = model(
+                pred_dist = model(
                     past_target,
                     future_features,
                     target_mean,
                     target_std,
-                    return_params=True
                 )
-                output = torch.stack([pred_params["loc"], pred_params["scale"]], dim=-1).squeeze(0)
+                affine = pred_dist.transforms[0]
+                loc = pred_dist.base_dist.loc * affine.scale + affine.loc
+                scale = pred_dist.base_dist.scale * affine.scale.abs()
+                output = torch.stack([loc, scale], dim=-1).squeeze(0)
+            elif model_type == "DNN_MIXN":
+                pred_dist = model(
+                    past_target,
+                    future_features,
+                    target_mean,
+                    target_std,
+                )
+                affine = pred_dist.transforms[0]
+                component_dist = pred_dist.base_dist.component_distribution
+                mixture_dist = pred_dist.base_dist.mixture_distribution
+                loc = component_dist.loc * affine.scale.unsqueeze(-1) + affine.loc.unsqueeze(-1)
+                scale = component_dist.scale * affine.scale.abs().unsqueeze(-1)
+                logits = mixture_dist.logits[:, 0, :]
+                horizon = loc.shape[1]
+                logits = logits.unsqueeze(1).expand(-1, horizon, -1)
+                output = torch.cat(
+                    [loc, scale, logits],
+                    dim=-1
+                ).squeeze(0)
             else:
                 raise ValueError(f"Model type {model_type} not supported")
 
@@ -670,10 +769,15 @@ def walk_forward_experiment(model_class, model_type):
             # sigma_y = s * sigma_z
             # output shape (L, 2) where first column is mu_y and second column is sigma_y
             output[:, 0] = output[:, 0] * p1 + p0
-            output[:, 1] = output[:, 1] * p1
+            output[:, 1] = output[:, 1] * p1.abs()
             future_target = future_target * p1 + p0
         elif model_type == "DNN_MIXN":
-            pass
+            num_components = int(args["mixture_components"])
+            output[:, :num_components] = output[:, :num_components] * p1.unsqueeze(1) + p0.unsqueeze(1)
+            output[:, num_components:2 * num_components] = (
+                output[:, num_components:2 * num_components] * p1.abs().unsqueeze(1)
+            )
+            future_target = future_target * p1 + p0
         else:
             raise ValueError(f"Model type {model_type} not supported")
 
@@ -685,6 +789,13 @@ def walk_forward_experiment(model_class, model_type):
             pred_columns = [f"q_{q:.2f}" for q in args['target_quantiles']]
         elif model_type == "DNN_N":
             pred_columns = ["loc", "scale"]
+        elif model_type == "DNN_MIXN":
+            num_components = int(args["mixture_components"])
+            pred_columns = (
+                [f"loc_{i+1}" for i in range(num_components)] +
+                [f"scale_{i+1}" for i in range(num_components)] +
+                [f"logit_{i+1}" for i in range(num_components)]
+            )
         else:
             raise ValueError(f"Model type {model_type} not supported")
 
@@ -716,16 +827,7 @@ def walk_forward_experiment(model_class, model_type):
 # In[ ]:
 
 
-walk_forward_experiment(DNN, "DNN")
-
-
-# In[ ]:
-
-
 # DISTRIBUTIONAL DNN (DNN_N)
-
-import torch.nn.functional as F
-import torch.distributions as dist
 
 class DNN_N(nn.Module):
     def __init__(self, args):
@@ -752,17 +854,7 @@ class DNN_N(nn.Module):
             self.out_features * self.args['predict_horizon']
         )
 
-    def forward(self, past_target, future_features, target_mean, target_std, return_params=False):
-        """
-        past_target:     (batch, context_window)
-        future_features: (batch, future_feat_dim)
-        target_mean:     (batch,) oppure (batch, 1)
-        target_std:      (batch,) oppure (batch, 1)
-
-        return:
-          - se return_params=False: una torch.distributions.Distribution
-          - se return_params=True:  dict con loc/scale normalizzati e denormalizzati
-        """
+    def forward(self, past_target, future_features, target_mean, target_std):
         x = torch.cat([past_target, future_features], dim=1)
 
         assert x.shape[1] == self.args['input_data_shape'], (
@@ -784,9 +876,8 @@ class DNN_N(nn.Module):
         # Come in TF: 1e-3 + 3 * softplus(...)
         scale_norm = 1e-3 + 3.0 * F.softplus(raw_scale)
 
-        # Broadcast su horizon
-        target_mean = target_mean.view(-1, 1)  # (batch, 1)
-        target_std = target_std.view(-1, 1)    # (batch, 1)
+        target_mean = target_mean.view(-1, 1)
+        target_std = target_std.view(-1, 1)
 
         # Distribuzione nello spazio normalizzato
         base_dist = dist.Normal(loc=loc_norm, scale=scale_norm)
@@ -797,28 +888,75 @@ class DNN_N(nn.Module):
             base_dist,
             [dist.transforms.AffineTransform(loc=target_mean, scale=target_std)]
         )
+        return transformed_dist
 
-        if return_params:
-            # Parametri equivalenti nello spazio originale
-            loc = loc_norm * target_std + target_mean
-            scale = scale_norm * target_std.abs()
 
-            return {
-                "dist": transformed_dist,
-                "loc_norm": loc_norm,
-                "scale_norm": scale_norm,
-                "loc": loc,
-                "scale": scale
-            }
+class DNN_MIXN(nn.Module):
+    def __init__(self, args):
+        super().__init__()
+        self.args = args
+        self.num_components = int(self.args['mixture_components'])
 
+        self.input_layer = nn.Sequential(
+            nn.Linear(self.args['input_data_shape'], self.args['hidden_size']),
+            nn.ReLU(),
+            nn.Dropout(p=self.args['dropout_rate'])
+        )
+
+        self.hidden_layers = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(self.args['hidden_size'], self.args['hidden_size']),
+                nn.ReLU(),
+                nn.Dropout(p=self.args['dropout_rate']),
+            ) for _ in range(self.args['hidden_layers'] - 1)
+        ])
+
+        self.out_features = 2 * self.args['predict_horizon'] * self.num_components + self.num_components
+        self.output_layer = nn.Linear(self.args['hidden_size'], self.out_features)
+
+    def forward(self, past_target, future_features, target_mean, target_std):
+        x = torch.cat([past_target, future_features], dim=1)
+
+        assert x.shape[1] == self.args['input_data_shape'], (
+            f"Input shape mismatch: expected {self.args['input_data_shape']}, got {x.shape[1]}"
+        )
+
+        x = self.input_layer(x)
+        for layer in self.hidden_layers:
+            x = layer(x)
+
+        out = self.output_layer(x)
+        horizon = self.args['predict_horizon']
+        comp_block = horizon * self.num_components
+
+        loc_norm = out[:, :comp_block].view(-1, horizon, self.num_components)
+        raw_scale = out[:, comp_block:2 * comp_block].view(-1, horizon, self.num_components)
+        logits_norm = out[:, 2 * comp_block:]
+        scale_norm = 1e-3 + 3.0 * F.softplus(raw_scale)
+        target_mean = target_mean.view(-1, 1)
+        target_std = target_std.view(-1, 1)
+
+        logits_tiled = logits_norm.view(-1, 1, self.num_components).expand(-1, self.args['predict_horizon'], -1)
+
+        mixture_dist = dist.Categorical(logits=logits_tiled)
+        component_dist = dist.Normal(loc=loc_norm, scale=scale_norm)
+        base_dist = dist.MixtureSameFamily(mixture_dist, component_dist)
+
+        transformed_dist = dist.TransformedDistribution(
+            base_dist,
+            [dist.transforms.AffineTransform(loc=target_mean, scale=target_std)]
+        )
         return transformed_dist
 
 
 
 
 
-walk_forward_experiment(DNN_N, "DNN_N")
+if __name__ == "__main__":
+    # walk_forward_experiment(DNN, "DNN")
+    # walk_forward_experiment(DNN_N, "DNN_N")
+    walk_forward_experiment(DNN_MIXN, "DNN_MIXN")
 
-
-compute_results_metrics(model_type="DNN")
-compute_results_metrics(model_type="DNN_N")
+    # compute_results_metrics(model_type="DNN")
+    # compute_results_metrics(model_type="DNN_N")
+    compute_results_metrics(model_type="DNN_MIXN")

@@ -402,40 +402,22 @@ def load_results_quantiles(
     pred_path = os.path.join("results", f"{model_type}_pred.csv")
     target_path = os.path.join("results", f"{model_type}_target.csv")
 
-    if not os.path.exists(pred_path):
-        raise FileNotFoundError(f"Prediction file not found: {pred_path}")
-    if not os.path.exists(target_path):
-        raise FileNotFoundError(f"Target file not found: {target_path}")
-
     preds_df = pd.read_csv(pred_path, parse_dates=["date"]).set_index("date").sort_index()
     target_df = pd.read_csv(target_path, parse_dates=["date"]).set_index("date").sort_index()
 
     common_index = target_df.index.intersection(preds_df.index)
-    if len(common_index) == 0:
-        raise ValueError(f"No overlapping dates between {pred_path} and {target_path}")
-
     preds_df = preds_df.loc[common_index]
     target_df = target_df.loc[common_index]
     y_true = target_df["target"].to_numpy(dtype=np.float64).reshape(-1, 1)
 
     if model_type == "DNN":
         quantile_columns = [col for col in preds_df.columns if col.startswith("q_")]
-        if not quantile_columns:
-            raise ValueError(f"No quantile columns found in {pred_path}")
-
         quantiles = np.array([float(col.split("_", 1)[1]) for col in quantile_columns], dtype=np.float64)
         order = np.argsort(quantiles)
         quantiles = quantiles[order]
         pred_quantiles = preds_df[quantile_columns].to_numpy(dtype=np.float64)[:, order]
     elif model_type == "DNN_N":
-        if not {"loc", "scale"}.issubset(preds_df.columns):
-            raise ValueError(f"{pred_path} must contain 'loc' and 'scale' columns")
-
-        if quantiles is None:
-            quantiles = np.asarray(args["target_quantiles"], dtype=np.float64)
-        else:
-            quantiles = np.asarray(quantiles, dtype=np.float64)
-        quantiles = np.sort(quantiles)
+        quantiles = np.sort(np.asarray(args["target_quantiles"] if quantiles is None else quantiles, dtype=np.float64))
 
         pred_quantiles = _sample_normal_quantiles(
             loc=preds_df["loc"].to_numpy(dtype=np.float64),
@@ -451,17 +433,7 @@ def load_results_quantiles(
         scale_columns = [f"scale_{i+1}" for i in range(num_components)]
         logit_columns = [f"logit_{i+1}" for i in range(num_components)]
 
-        expected_columns = set(loc_columns + scale_columns + logit_columns)
-        if not expected_columns.issubset(preds_df.columns):
-            raise ValueError(
-                f"{pred_path} must contain mixture columns {sorted(expected_columns)}"
-            )
-
-        if quantiles is None:
-            quantiles = np.asarray(args["target_quantiles"], dtype=np.float64)
-        else:
-            quantiles = np.asarray(quantiles, dtype=np.float64)
-        quantiles = np.sort(quantiles)
+        quantiles = np.sort(np.asarray(args["target_quantiles"] if quantiles is None else quantiles, dtype=np.float64))
 
         pred_quantiles = _sample_mixnormal_quantiles(
             loc=preds_df[loc_columns].to_numpy(dtype=np.float64),
@@ -472,8 +444,6 @@ def load_results_quantiles(
             seed=args["seed"] if seed is None else seed,
             chunk_size=chunk_size,
         )
-    else:
-        raise ValueError(f"Model type {model_type} not supported")
 
     return y_true, pred_quantiles[:, None, :], quantiles, common_index
 

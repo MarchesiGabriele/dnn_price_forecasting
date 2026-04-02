@@ -339,11 +339,12 @@ def _sample_normal_quantiles(
 
     for start in range(0, loc.shape[0], chunk_size):
         end = min(start + chunk_size, loc.shape[0])
-        draws = rng.normal(
-            loc=loc[start:end, None],
-            scale=scale[start:end, None],
-            size=(end - start, num_samples),
-        )
+        loc_chunk = torch.as_tensor(loc[start:end], dtype=torch.float64)
+        scale_chunk = torch.as_tensor(scale[start:end], dtype=torch.float64)
+        normal_dist = dist.Normal(loc=loc_chunk, scale=scale_chunk)
+
+        torch.manual_seed(int(rng.integers(0, 2**31 - 1)))
+        draws = normal_dist.sample((num_samples,)).cpu().numpy().T
         sampled_quantiles[start:end] = np.quantile(draws, quantiles, axis=1).T
 
     return sampled_quantiles
@@ -376,22 +377,16 @@ def _sample_mixnormal_quantiles(
 
     for start in range(0, loc.shape[0], chunk_size):
         end = min(start + chunk_size, loc.shape[0])
-        loc_chunk = loc[start:end]
-        scale_chunk = scale[start:end]
-        logits_chunk = logits[start:end]
+        loc_chunk = torch.as_tensor(loc[start:end], dtype=torch.float64)
+        scale_chunk = torch.as_tensor(scale[start:end], dtype=torch.float64)
+        logits_chunk = torch.as_tensor(logits[start:end], dtype=torch.float64)
 
-        shifted_logits = logits_chunk - logits_chunk.max(axis=1, keepdims=True)
-        probs = np.exp(shifted_logits)
-        probs /= probs.sum(axis=1, keepdims=True)
+        mix = dist.Categorical(logits=logits_chunk)
+        comp = dist.Normal(loc=loc_chunk, scale=scale_chunk)
+        mix_dist = dist.MixtureSameFamily(mix, comp)
 
-        cdf = np.cumsum(probs, axis=1)
-        uniforms = rng.random((end - start, num_samples))
-        comp_idx = np.sum(uniforms[..., None] > cdf[:, None, :-1], axis=-1)
-
-        row_idx = np.arange(end - start)[:, None]
-        chosen_loc = loc_chunk[row_idx, comp_idx]
-        chosen_scale = scale_chunk[row_idx, comp_idx]
-        draws = rng.normal(loc=chosen_loc, scale=chosen_scale)
+        torch.manual_seed(int(rng.integers(0, 2**31 - 1)))
+        draws = mix_dist.sample((num_samples,)).cpu().numpy().T
         sampled_quantiles[start:end] = np.quantile(draws, quantiles, axis=1).T
 
     return sampled_quantiles

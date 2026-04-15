@@ -324,7 +324,6 @@ def _sample_normal_quantiles(
     quantiles: np.ndarray,
     num_samples: int = 1000,
     seed: int = 20,
-    chunk_size: int = 512,
 ) -> np.ndarray:
     loc = np.asarray(loc, dtype=np.float64)
     scale = np.asarray(scale, dtype=np.float64)
@@ -335,19 +334,13 @@ def _sample_normal_quantiles(
         scale = np.maximum(scale, 1e-6)
 
     rng = np.random.default_rng(seed)
-    sampled_quantiles = np.empty((loc.shape[0], quantiles.shape[0]), dtype=np.float64)
+    loc_tensor = torch.as_tensor(loc, dtype=torch.float64)
+    scale_tensor = torch.as_tensor(scale, dtype=torch.float64)
+    normal_dist = dist.Normal(loc=loc_tensor, scale=scale_tensor)
 
-    for start in range(0, loc.shape[0], chunk_size):
-        end = min(start + chunk_size, loc.shape[0])
-        loc_chunk = torch.as_tensor(loc[start:end], dtype=torch.float64)
-        scale_chunk = torch.as_tensor(scale[start:end], dtype=torch.float64)
-        normal_dist = dist.Normal(loc=loc_chunk, scale=scale_chunk)
-
-        torch.manual_seed(int(rng.integers(0, 2**31 - 1)))
-        draws = normal_dist.sample((num_samples,)).cpu().numpy().T
-        sampled_quantiles[start:end] = np.quantile(draws, quantiles, axis=1).T
-
-    return sampled_quantiles
+    torch.manual_seed(int(rng.integers(0, 2**31 - 1)))
+    draws = normal_dist.sample((num_samples,)).cpu().numpy().T
+    return np.quantile(draws, quantiles, axis=1).T
 
 
 def _sample_mixnormal_quantiles(
@@ -357,7 +350,6 @@ def _sample_mixnormal_quantiles(
     quantiles: np.ndarray,
     num_samples: int = 1000,
     seed: int = 20,
-    chunk_size: int = 512,
 ) -> np.ndarray:
     loc = np.asarray(loc, dtype=np.float64)
     scale = np.asarray(scale, dtype=np.float64)
@@ -373,23 +365,17 @@ def _sample_mixnormal_quantiles(
         scale = np.maximum(scale, 1e-6)
 
     rng = np.random.default_rng(seed)
-    sampled_quantiles = np.empty((loc.shape[0], quantiles.shape[0]), dtype=np.float64)
+    loc_tensor = torch.as_tensor(loc, dtype=torch.float64)
+    scale_tensor = torch.as_tensor(scale, dtype=torch.float64)
+    logits_tensor = torch.as_tensor(logits, dtype=torch.float64)
 
-    for start in range(0, loc.shape[0], chunk_size):
-        end = min(start + chunk_size, loc.shape[0])
-        loc_chunk = torch.as_tensor(loc[start:end], dtype=torch.float64)
-        scale_chunk = torch.as_tensor(scale[start:end], dtype=torch.float64)
-        logits_chunk = torch.as_tensor(logits[start:end], dtype=torch.float64)
+    mix = dist.Categorical(logits=logits_tensor)
+    comp = dist.Normal(loc=loc_tensor, scale=scale_tensor)
+    mix_dist = dist.MixtureSameFamily(mix, comp)
 
-        mix = dist.Categorical(logits=logits_chunk)
-        comp = dist.Normal(loc=loc_chunk, scale=scale_chunk)
-        mix_dist = dist.MixtureSameFamily(mix, comp)
-
-        torch.manual_seed(int(rng.integers(0, 2**31 - 1)))
-        draws = mix_dist.sample((num_samples,)).cpu().numpy().T
-        sampled_quantiles[start:end] = np.quantile(draws, quantiles, axis=1).T
-
-    return sampled_quantiles
+    torch.manual_seed(int(rng.integers(0, 2**31 - 1)))
+    draws = mix_dist.sample((num_samples,)).cpu().numpy().T
+    return np.quantile(draws, quantiles, axis=1).T
 
 
 def load_results_quantiles(
@@ -397,7 +383,6 @@ def load_results_quantiles(
     quantiles: np.ndarray | None = None,
     num_samples: int = 1000,
     seed: int | None = None,
-    chunk_size: int = 512,
 ):
     pred_path = os.path.join("results", f"{model_type}_pred.csv")
     target_path = os.path.join("results", f"{model_type}_target.csv")
@@ -425,7 +410,6 @@ def load_results_quantiles(
             quantiles=quantiles,
             num_samples=num_samples,
             seed=args["seed"] if seed is None else seed,
-            chunk_size=chunk_size,
         )
     elif model_type == "DNN_MIXN":
         num_components = int(args["mixture_components"])
@@ -442,7 +426,6 @@ def load_results_quantiles(
             quantiles=quantiles,
             num_samples=num_samples,
             seed=args["seed"] if seed is None else seed,
-            chunk_size=chunk_size,
         )
 
     return y_true, pred_quantiles[:, None, :], quantiles, common_index
@@ -455,14 +438,12 @@ def compute_results_metrics(
     num_samples: int = 1000,
     seed: int | None = None,
     point_quantile: float = 0.50,
-    chunk_size: int = 512,
 ):
     y_true, pred_quantiles, quantiles, common_index = load_results_quantiles(
         model_type=model_type,
         quantiles=quantiles,
         num_samples=num_samples,
         seed=seed,
-        chunk_size=chunk_size,
     )
 
     point_idx = int(np.abs(quantiles - point_quantile).argmin())

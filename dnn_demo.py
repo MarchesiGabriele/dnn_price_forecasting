@@ -6,6 +6,8 @@
 
 import os
 import gc
+from pathlib import Path
+from urllib.request import urlretrieve
 import numpy as np
 import pandas as pd
 import torch
@@ -14,6 +16,21 @@ from torch.utils.tensorboard import SummaryWriter
 from torch import nn
 import torch.nn.functional as F
 import torch.distributions as dist
+
+
+REPO_RAW_BASE_URL = "https://raw.githubusercontent.com/MarchesiGabriele/dnn_price_forecasting/main"
+
+
+def ensure_repo_file(relative_path: str) -> Path:
+    path = Path(relative_path)
+    if path.exists():
+        return path
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    download_url = f"{REPO_RAW_BASE_URL}/{relative_path}"
+    print(f"Downloading {relative_path} from {download_url}")
+    urlretrieve(download_url, path)
+    return path
 
 
 # In[ ]:
@@ -46,7 +63,7 @@ args = {
     'patience': 10,
     'learning_rate': 5e-4,
     'batch_size': 128,
-    'num_workers': 4,
+    'num_workers': 0,
 }
 
 
@@ -73,13 +90,16 @@ os.makedirs(f'results', exist_ok=True)
 
 # LOADING DATA
 
-df_raw = pd.read_csv("./BE/df_full_scaled.csv")
+df_raw_path = ensure_repo_file("BE/df_full_scaled.csv")
+denorm_params_path = ensure_repo_file("BE/df_target_denorm_params.csv")
+
+df_raw = pd.read_csv(df_raw_path)
 feature_cols = list(df_raw.columns)
 feature_cols.remove('TARG__target_scaled')
 feature_cols.remove('date')
 df_raw['date'] = pd.to_datetime(df_raw['date'])
 
-denorm_params = pd.read_csv("./BE/df_target_denorm_params.csv")
+denorm_params = pd.read_csv(denorm_params_path)
 denorm_params['date'] = pd.to_datetime(denorm_params['date'])
 
 cons_cols = [col for col in feature_cols if 'CONS' in col]

@@ -489,10 +489,11 @@ def train_on_split(train_raw, suffix, feature_cols, model_class, model_type):
         raise ValueError(f"Model type {model_type} not supported")
     optimizer = torch.optim.Adam(model.parameters(), lr=args['learning_rate'])
 
-    # TensorBoard writer for this specific ricalibration
-    # Using suffix (which contains region, seed and week) to separate logs
-    log_dir = os.path.join(f'log_dir', 'tensorboard', suffix)
-    writer = SummaryWriter(log_dir=log_dir)
+    run_name = f"{model_type}_{suffix}"
+    checkpoint_path = os.path.join("checkpoints", f"best_model_{run_name}.pth")
+    run_log_dir = os.path.join("log_dir", model_type, suffix)
+    writer = SummaryWriter(log_dir=run_log_dir)
+    print(f"TensorBoard logs: {run_log_dir}")
 
     # Build ONE dataset from all train data, with daily alignment (1 sample per day)
     full_dataset = CustomDataset(
@@ -578,7 +579,7 @@ def train_on_split(train_raw, suffix, feature_cols, model_class, model_type):
         if np.mean(val_losses) < best_val_loss: 
             print(f"New best validation loss: {np.mean(val_losses):.4f}, saving model...")
             best_val_loss = np.mean(val_losses)
-            torch.save(model.state_dict(), f'checkpoints/best_model_{suffix}.pth')
+            torch.save(model.state_dict(), checkpoint_path)
             patience_counter = 0
         else:
             patience_counter += 1
@@ -616,6 +617,7 @@ def walk_forward_experiment(model_class, model_type):
 
         # Check if we need to retrain
         if day_count % args['recalibration_shift_days'] == 0:
+            run_suffix = f"week{day_count // args['recalibration_shift_days']}_{args['region']}_{args['seed']}"
             print(f"Retraining - MarketRegion: {args['region']} - Seed: {args['seed']} - Retrain split: {day_count // args['recalibration_shift_days']} / {int(365/args['recalibration_shift_days'])}")
             print("First day of train data: ", train_raw['date'].iloc[0])
             print("Last day of train data: ", train_raw['date'].iloc[-1])
@@ -626,16 +628,18 @@ def walk_forward_experiment(model_class, model_type):
 
             train_on_split(
                 train_raw=train_raw,
-                suffix=f"week{day_count // args['recalibration_shift_days']}_{args['region']}_{args['seed']}",
+                suffix=run_suffix,
                 feature_cols=feature_cols,
                 model_class=model_class,
                 model_type=model_type
             )
 
         # Evaluation
+        run_suffix = f"week{day_count // args['recalibration_shift_days']}_{args['region']}_{args['seed']}"
+        checkpoint_path = os.path.join("checkpoints", f"best_model_{model_type}_{run_suffix}.pth")
         model = model_class(args) 
         model.to(device)
-        model.load_state_dict(torch.load(f"checkpoints/best_model_week{day_count // args['recalibration_shift_days']}_{args['region']}_{args['seed']}.pth"))
+        model.load_state_dict(torch.load(checkpoint_path))
         model.eval()
 
         test_dataset = CustomDataset(

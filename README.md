@@ -15,7 +15,7 @@ Example of spot market price: Belgium 22/05/2026
 ![](image.png)
 
 
-COLAB LINK: https://colab.research.google.com/drive/1INarxWebWKU_NQTCI1KXvzQylKAnH1zj?usp=sharing
+COLAB LINK: https://colab.research.google.com/drive/1pg99-YFM5Ct6F-Bvwygi4MR3l-5xgvkF?usp=sharing
 
 
 
